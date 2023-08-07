@@ -623,7 +623,7 @@ class LOTClassTrainer(object):
                 #     if i in res["category_doc_num"]:
                 #         category_doc_num[i] += res["category_doc_num"][i]
                 if i in gather_res["category_doc_num"]:
-                    category_doc_num[i] += "category_doc_num"[i]
+                    category_doc_num[i] += gather_res["category_doc_num"][i]
             LOGS.log.debug(
                 f"Number of documents with category indicative terms found for each category is: {category_doc_num}")
             self.mcp_data = {"input_ids": all_input_ids, "attention_masks": all_input_mask, "labels": all_mask_label}
@@ -682,19 +682,19 @@ class LOTClassTrainer(object):
             #       LOGS.log.debug(f"Average training loss: {avg_train_loss.mean().item()}")#求loss的平均值，单卡不用求均值
                 LOGS.log.debug(f"Average training loss: {avg_train_loss.item()}")
             # #if rank == 0:
-            loader_file = os.path.join(self.dataset_dir, loader_name)
-            torch.save(self.model.module.state_dict(), loader_file)
+            loader_file = os.path.join(self.model_dir, loader_name)
+            torch.save(self.model.state_dict(), loader_file)
         except RuntimeError as err:
             self.cuda_mem_error(err, "train")
 
     # masked category prediction
     def mcp(self, top_pred_num=50, match_threshold=20, epochs=5, loader_name="mcp_model.pt"):
-        loader_file = os.path.join(self.dataset_dir, loader_name) #os.path.join拼接路径
+        loader_file = os.path.join(self.model_dir, loader_name) #os.path.join拼接路径
         if os.path.exists(loader_file): #os.path.exists檢查指定的路徑是否存在
             LOGS.log.debug(f"\nLoading model trained via masked category prediction from {loader_file}") #log.debug程序调试bug
         else:
             self.prepare_mcp(top_pred_num, match_threshold)
             LOGS.log.debug(f"\nTraining model via masked category prediction.")
-            self.mcp_dist()
+            self.mcp_dist(epochs, loader_name)
             #mp.spawn(self.mcp_dist, nprocs=self.world_size, args=(epochs, loader_name))
         self.model.load_state_dict(torch.load(loader_file))

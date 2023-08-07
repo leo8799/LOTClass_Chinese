@@ -3,14 +3,14 @@ log:
   log_file_name: 'LOTClass.log'
 
 project:
-  PROJECT_NAME: 'news_clas'
+  PROJECT_NAME: 'Text_Classification'
   VERSION: 'v1'
 
 data:
   test_date_rate: 0.2
   DATASET: 'datasets'
   MODEL: 'model'
-  stop_words: 'stop_words.txt'
+  stop_words: 'HIT_stop_words.txt'
   LABEL_NAME_FILE: 'label_names.txt'
   TRAIN_CORPUS: 'train_content.txt'
   TEST_CORPUS: 'test_content.txt'
@@ -33,8 +33,8 @@ train_args:
   CUDA_VISIBLE_DEVICES: '0,1,2,3'
   # GPU数量
   GPUS: 1
-  MCP_EPOCH: 10
-  SELF_TRAIN_EPOCH: 1
+  MCP_EPOCH: 20
+  SELF_TRAIN_EPOCH: 5
 #  dist_port: 18989
   update_interval: 50
   match_threshold: 3
