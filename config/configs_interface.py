@@ -16,8 +16,9 @@ class ProjectConfigs(BaseModel):
 
 class DataConfigs(BaseModel):
     test_date_rate: float = 0.2
-    DATASET: str = "datasets/sogounews"
-    stop_words: str = 'HIT_stop_words.txt'
+    DATASET: str = "datasets"
+    MODEL: str = "model"
+    stop_words: str = 'stop_words.txt'
     LABEL_NAME_FILE: str = "label_names.txt"
     TRAIN_CORPUS: str = "train_content.txt"
     TEST_CORPUS: str = "test_content.txt"
