@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import TensorDataset, DataLoader, SequentialSampler
-
+from transformers import BertTokenizer, AdamW, get_linear_schedule_with_warmup
 
 from src.model import LOTClassModel
 from config.configs_interface import Configs
@@ -68,7 +68,6 @@ class LOTClassTrainer(object):
                        args.data.TRAIN_LABEL,
                        args.data.TEST_LABEL)
         self.with_test_label = True if args.data.TEST_LABEL is not None else False
-        # self.temp_dir = "tmp_{}".format(self.dist_port)
         self.mcp_loss = nn.CrossEntropyLoss()
         self.st_loss = nn.KLDivLoss(reduction='batchmean')
         self.update_interval = args.train_args.update_interval
@@ -371,6 +370,7 @@ class LOTClassTrainer(object):
             total_steps = int(
                 len(self.train_data["input_ids"]) * epochs / (self.world_size * self.train_batch_size * self.accum_steps))
             optimizer = AdamW(filter(lambda p: p.requires_grad, self.model.parameters()), lr=1e-6, eps=1e-8)
+# <<<<<<< HEAD
             scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0.1 * total_steps, num_training_steps=total_steps)  # 线性预热
 
             idx = 0
@@ -532,3 +532,169 @@ class LOTClassTrainer(object):
         f_out = open(out_file, 'w')
         for label in pred_labels:
             f_out.write(str(label.item()) + '\n')
+
+
+
+
+
+    def prepare_mcp_dist(self, top_pred_num=50, match_threshold=20, loader_name="mcp_train.pt"):
+        # 调用self.set_up_dist方法设置分布式训练的模型，并将模型设为评估模式
+        self.model.eval()
+        # 调用self.make_dataloader方法创建一个数据加载器，用于加载训练数据
+        train_dataset_loader = self.make_dataloader(self.train_data, self.eval_batch_size)
+        #初始化一些空列表和字典，用于存储数据
+        all_input_ids = []
+        all_mask_label = []
+        all_input_mask = []
+        category_doc_num = defaultdict(int)
+        wrap_train_dataset_loader = tqdm(train_dataset_loader)
+        try: #遍历训练数据加载器中的每个批次，对每个批次进行处理
+            for batch in wrap_train_dataset_loader:
+                with torch.no_grad():
+                    input_ids = batch[0].to(device)
+                    input_mask = batch[1].to(device)
+                    predictions = self.model(input_ids, #利用模型进行预测，获取预测结果
+                                        pred_mode="mlm",
+                                        token_type_ids=None,
+                                        attention_mask=input_mask)
+                    _, sorted_res = torch.topk(predictions, top_pred_num, dim=-1)
+                    for i, category_vocab in self.category_vocab.items():
+                        match_idx = torch.zeros_like(sorted_res).bool()#torch.zeros_like()生成与给定张量形状相同的全0张量;bool()将给定参数转化为布尔类型
+                        for word_id in category_vocab:
+                            match_idx = (sorted_res == word_id) | match_idx # | :按位或运算符---只要对应的二个二进位有一个为1时，结果位就为1
+                        match_count = torch.sum(match_idx.int(), dim=-1)#对于每个类别的词汇表，计算预测结果与词汇表中的词是否匹配，得到匹配的数量
+                        # 根据匹配数量和输入的掩码，确定有效的文档
+                        valid_idx = (match_count > match_threshold) & (input_mask > 0)
+                        valid_doc = torch.sum(valid_idx, dim=-1) > 0
+                        # 如果存在有效的文档，将相应的输入、掩码和标签添加到对应的列表中
+                        if valid_doc.any():
+                            mask_label = -1 * torch.ones_like(input_ids)
+                            mask_label[valid_idx] = i
+                            all_input_ids.append(input_ids[valid_doc].cpu())
+                            all_mask_label.append(mask_label[valid_doc].cpu())
+                            all_input_mask.append(input_mask[valid_doc].cpu())
+                            #统计每个类别的文档数量
+                            category_doc_num[i] += valid_doc.int().sum().item()
+            # 将列表中的数据拼接成张量
+            all_input_ids = torch.cat(all_input_ids, dim=0)
+            all_mask_label = torch.cat(all_mask_label, dim=0)
+            all_input_mask = torch.cat(all_input_mask, dim=0)
+            # 保存数据到一个字典中
+            save_dict = {
+                "all_input_ids": all_input_ids,
+                "all_mask_label": all_mask_label,
+                "all_input_mask": all_input_mask,
+                "category_doc_num": category_doc_num,
+            }
+            # 如果数据长度为0，抛出一个异常
+            if len(all_input_ids) == 0:
+                raise ValueError('len(all_input_ids) == 0')
+            # 将字典临时保存到文件中
+            #torch.save(save_dict, save_file)
+            return save_dict #因为gather_res的值是文件的输出，如果把加载注释掉就没有输出
+        except RuntimeError as err:
+            #如果运行时出现错误，调用self.cuda_mem_error方法处理错误
+            self.cuda_mem_error(err, "eval")
+
+    def prepare_mcp(self, top_pred_num=50, match_threshold=20, loader_name="mcp_train.pt"):
+        loader_file = os.path.join(self.dataset_dir, loader_name)
+        if os.path.exists(loader_file):
+            LOGS.log.debug(f"Loading masked category prediction data from {loader_file}")
+            self.mcp_data = torch.load(loader_file)
+        else:
+            loader_file = os.path.join(self.dataset_dir, loader_name)
+            LOGS.log.debug("Preparing self supervision for masked category prediction.")
+            gather_res = self.prepare_mcp_dist(top_pred_num, match_threshold)#save_dict #把上面return的save_dict赋值给gather_res
+            # for f in os.listdir(self.temp_dir):
+            #     if f[-3:] == '.pt':
+            #         gather_res.append(torch.load(os.path.join(self.temp_dir, f)))#加载临时文件
+            #         #长度不相同就报错，=1 √ =0 ×  .world_size是gpu的数量，单卡不需要判断是否相等
+            #assert len(gather_res) == self.world_size, "Number of saved files not equal to number of processes!"
+            #单卡不需要 循环(for) 合并(torch.cat) 直接赋值就可以
+            # all_input_ids = torch.cat([res["all_input_ids"] for res in gather_res], dim=0)
+            # all_mask_label = torch.cat([res["all_mask_label"] for res in gather_res], dim=0)
+            # all_input_mask = torch.cat([res["all_input_mask"] for res in gather_res], dim=0)
+            all_input_ids = gather_res["all_input_ids"]
+            all_mask_label = gather_res["all_mask_label"]
+            all_input_mask = gather_res["all_input_mask"]
+            category_doc_num = {i: 0 for i in range(self.num_class)}
+            for i in category_doc_num:
+                # for res in gather_res:
+                #     if i in res["category_doc_num"]:
+                #         category_doc_num[i] += res["category_doc_num"][i]
+                if i in gather_res["category_doc_num"]:
+                    category_doc_num[i] += "category_doc_num"[i]
+            LOGS.log.debug(
+                f"Number of documents with category indicative terms found for each category is: {category_doc_num}")
+            self.mcp_data = {"input_ids": all_input_ids, "attention_masks": all_input_mask, "labels": all_mask_label}
+            torch.save(self.mcp_data, loader_file)
+            # if os.path.exists(self.temp_dir):
+            #     shutil.rmtree(self.temp_dir)  #释放临时文件，单卡不需要直接注释
+            for i in category_doc_num:
+                assert category_doc_num[
+                           i] > 10, f"Too few ({category_doc_num[i]}) documents with category indicative terms found for category {i}; " \
+                                    "try to add more unlabeled documents to the training corpus (recommend) or reduce `--match_threshold` (not recommend)"
+        LOGS.log.debug(f"There are totally {len(self.mcp_data['input_ids'])} documents with category indicative terms.")
+
+    # masked category prediction (distributed function)
+    def mcp_dist(self, epochs=5, loader_name="mcp_model.pt"):
+        #model = self.set_up_dist(device)
+        mcp_dataset_loader = self.make_dataloader(self.mcp_data, self.train_batch_size)
+        total_steps = len(mcp_dataset_loader) * epochs / self.accum_steps
+        optimizer = AdamW(filter(lambda p: p.requires_grad, self.model.parameters()), lr=2e-5, eps=1e-8)
+        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0.1 * total_steps,
+                                                    num_training_steps=total_steps)
+        try:
+            for i in range(epochs):
+                self.model.train()
+                total_train_loss = 0
+                #if rank == 0:
+                LOGS.log.debug(f"Epoch {i + 1}:")
+                wrap_mcp_dataset_loader = tqdm(mcp_dataset_loader) #if rank == 0 else mcp_dataset_loader
+                self.model.zero_grad()
+                for j, batch in enumerate(wrap_mcp_dataset_loader):
+                    input_ids = batch[0].to(device)
+                    input_mask = batch[1].to(device)
+                    labels = batch[2].to(device)
+                    mask_pos = labels >= 0
+                    labels = labels[mask_pos]
+                    # mask out category indicative words
+                    input_ids[mask_pos] = self.mask_id
+                    logits = self.model(input_ids,
+                                   pred_mode="classification",
+                                   token_type_ids=None,
+                                   attention_mask=input_mask)
+                    logits = logits[mask_pos]
+                    loss = self.mcp_loss(logits.view(-1, self.num_class), labels.view(-1)) / self.accum_steps
+                    total_train_loss += loss.item()
+                    loss.backward()
+                    if (j + 1) % self.accum_steps == 0:
+                        # Clip the norm of the gradients to 1.0.
+                        nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                        optimizer.step()
+                        scheduler.step()
+                        self.model.zero_grad()
+                avg_train_loss = torch.tensor([total_train_loss / len(mcp_dataset_loader) * self.accum_steps]).to(device)
+            #     gather_list = [torch.ones_like(avg_train_loss) for _ in range(self.world_size)]#world_size是gpu的数量，将每一个gpu的loss遍历形成列表
+            #     dist.all_gather(gather_list, avg_train_loss)
+            #     avg_train_loss = torch.tensor(gather_list)#转成张量
+            #     if rank == 0:
+            #       LOGS.log.debug(f"Average training loss: {avg_train_loss.mean().item()}")#求loss的平均值，单卡不用求均值
+                LOGS.log.debug(f"Average training loss: {avg_train_loss.item()}")
+            # #if rank == 0:
+            loader_file = os.path.join(self.dataset_dir, loader_name)
+            torch.save(self.model.module.state_dict(), loader_file)
+        except RuntimeError as err:
+            self.cuda_mem_error(err, "train")
+
+    # masked category prediction
+    def mcp(self, top_pred_num=50, match_threshold=20, epochs=5, loader_name="mcp_model.pt"):
+        loader_file = os.path.join(self.dataset_dir, loader_name) #os.path.join拼接路径
+        if os.path.exists(loader_file): #os.path.exists檢查指定的路徑是否存在
+            LOGS.log.debug(f"\nLoading model trained via masked category prediction from {loader_file}") #log.debug程序调试bug
+        else:
+            self.prepare_mcp(top_pred_num, match_threshold)
+            LOGS.log.debug(f"\nTraining model via masked category prediction.")
+            self.mcp_dist()
+            #mp.spawn(self.mcp_dist, nprocs=self.world_size, args=(epochs, loader_name))
+        self.model.load_state_dict(torch.load(loader_file))
