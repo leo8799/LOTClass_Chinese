@@ -12,7 +12,7 @@ from src.model import LOTClassModel
 from config.configs_interface import Configs
 from src.logers import LOGS
 
-from transformers import AdamW
+from transformers import BertTokenizer, AdamW, get_linear_schedule_with_warmup
 from tqdm import tqdm
 from collections import defaultdict
 from joblib import Parallel, delayed
@@ -37,6 +37,7 @@ class LOTClassTrainer(object):
         self.args = args
         self.max_len = args.train_args.MAX_LEN
         self.dataset_dir = args.data.DATASET
+        self.model_dir = args.data.MODEL
         self.num_cpus = min(4, cpu_count() - 4) if cpu_count() > 1 else 1
         self.world_size = args.train_args.GPUS
         self.train_batch_size = args.train_args.TRAIN_BATCH
@@ -349,7 +350,7 @@ class LOTClassTrainer(object):
                 )
             else:
                 LOGS.log.debug(
-                    "Your GPUs can't hold the current batch size for training, try to reduce `--train_batch_size`, current: {}".format(self.eval_batch_size)
+                    "Your GPUs can't hold the current batch size for training, try to reduce `--train_batch_size`, current: {}".format(self.train_batch_size)
                 )
         sys.exit(1)
 
@@ -363,11 +364,175 @@ class LOTClassTrainer(object):
             self.train_data = {"input_ids": self.train_data["input_ids"][rand_idx],
                                "attention_masks": self.train_data["attention_masks"][rand_idx]}
             LOGS.log.debug("\nStart self-training.")
+
             test_dataset_loader = self.make_dataloader(self.test_data,
                                                        self.eval_batch_size) if self.with_test_label else None
             total_steps = int(
                 len(self.train_data["input_ids"]) * epochs / (self.world_size * self.train_batch_size * self.accum_steps))
             optimizer = AdamW(filter(lambda p: p.requires_grad, self.model.parameters()), lr=1e-6, eps=1e-8)
+# <<<<<<< HEAD
+            scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0.1 * total_steps, num_training_steps=total_steps)  # 线性预热
+
+            idx = 0
+            if self.early_stop:
+                agree_count = 0
+            for i in range(int(total_steps / self.update_interval)):
+                self_train_dict, idx, agree = self.prepare_self_train_data(self.model, idx)
+
+                if self.early_stop:
+                    if 1 - agree < 1e-3:
+                        agree_count += 1
+                    else:
+                        agree_count = 0
+                    if agree_count >= 3:
+                        break
+                self_train_dataset_loader = self.make_dataloader(self_train_dict, self.train_batch_size)
+                self.self_train_batches(self.model, self_train_dataset_loader, optimizer, scheduler, test_dataset_loader)
+            loader_file = os.path.join(self.model_dir, loader_name)
+            LOGS.log.debug(f"Saving final model to {loader_file}")
+            torch.save(self.model.state_dict(), loader_file)
+    #  根据update_interval 准备数据以及目标分布
+    def prepare_self_train_data(self, model, idx):
+        target_num = min(self.world_size * self.train_batch_size * self.update_interval * self.accum_steps,
+                         len(self.train_data["input_ids"]))
+        if idx + target_num >= len(self.train_data["input_ids"]):
+            select_idx = torch.cat((torch.arange(idx, len(self.train_data["input_ids"])),
+                                    torch.arange(idx + target_num - len(self.train_data["input_ids"]))))
+        else:
+            select_idx = torch.arange(idx, idx + target_num)
+        assert len(select_idx) == target_num
+        idx = (idx + len(select_idx)) % len(self.train_data["input_ids"])
+        select_dataset = {"input_ids": self.train_data["input_ids"][select_idx],
+                          "attention_masks": self.train_data["attention_masks"][select_idx]}
+        dataset_loader = self.make_dataloader(select_dataset, self.eval_batch_size)
+        input_ids, input_mask, all_preds = self.inference(model, dataset_loader, return_type="data")
+
+        # gather_input_ids = [torch.ones_like(input_ids) for _ in range(self.world_size)]
+        # gather_input_mask = [torch.ones_like(input_mask) for _ in range(self.world_size)]
+        # gather_preds = [torch.ones_like(preds) for _ in range(self.world_size)]
+        # dist.all_gather(gather_input_ids, input_ids)
+        # dist.all_gather(gather_input_mask, input_mask)
+        # dist.all_gather(gather_preds, preds)
+        # input_ids = torch.cat(gather_input_ids, dim=0).cpu()
+        # input_mask = torch.cat(gather_input_mask, dim=0).cpu()
+        # all_preds = torch.cat(gather_preds, dim=0).cpu()
+
+        weight = all_preds ** 2 / torch.sum(all_preds, dim=0)
+        target_dist = (weight.t() / torch.sum(weight, dim=1)).t()  # torch.t(): 求转置
+        all_target_pred = target_dist.argmax(dim=-1)
+        agree = (all_preds.argmax(dim=-1) == all_target_pred).int().sum().item() / len(all_target_pred)  # early-stop的指标
+        self_train_dict = {"input_ids": input_ids, "attention_masks": input_mask, "labels": target_dist}
+        return self_train_dict, idx, agree
+
+    # 使用模型推理有三种模式：准备数据（目标分布）、计算准确率、预测
+    def inference(self, model, dataset_loader, return_type):
+        if return_type == "data":
+            all_input_ids = []
+            all_input_mask = []
+            all_preds = []
+        elif return_type == "acc":
+            pred_labels = []
+            truth_labels = []
+        elif return_type == "pred":
+            pred_labels = []
+        model.eval()
+        try:
+            for batch in dataset_loader:
+                with torch.no_grad():
+                    input_ids = batch[0].to(device)
+                    input_mask = batch[1].to(device)
+                    logits = model(input_ids,
+                                   pred_mode="classification",
+                                   token_type_ids=None,
+                                   attention_mask=input_mask)
+                    logits = logits[:, 0, :]
+                    if return_type == "data":
+                        all_input_ids.append(input_ids)
+                        all_input_mask.append(input_mask)
+                        all_preds.append(nn.Softmax(dim=-1)(logits))
+                    elif return_type == "acc":
+                        labels = batch[2]
+                        pred_labels.append(torch.argmax(logits, dim=-1).cpu())
+                        truth_labels.append(labels)
+                    elif return_type == "pred":
+                        pred_labels.append(torch.argmax(logits, dim=-1).cpu())
+            if return_type == "data":
+                all_input_ids = torch.cat(all_input_ids, dim=0)
+                all_input_mask = torch.cat(all_input_mask, dim=0)
+                all_preds = torch.cat(all_preds, dim=0)
+                return all_input_ids, all_input_mask, all_preds
+            elif return_type == "acc":
+                pred_labels = torch.cat(pred_labels, dim=0)
+                truth_labels = torch.cat(truth_labels, dim=0)
+                samples = len(truth_labels)
+                acc = (pred_labels == truth_labels).float().sum() / samples
+                return acc.to(device)
+            elif return_type == "pred":
+                pred_labels = torch.cat(pred_labels, dim=0)
+                return pred_labels
+        except RuntimeError as err:
+            self.cuda_mem_error(err, "eval")
+
+    # 自训练
+    def self_train_batches(self, model, self_train_loader, optimizer, scheduler, test_dataset_loader):
+        model.train()
+        total_train_loss = 0
+        wrap_train_dataset_loader = tqdm(self_train_loader)
+        model.zero_grad()
+        try:
+            for j, batch in enumerate(wrap_train_dataset_loader):
+                input_ids = batch[0].to(device)
+                input_mask = batch[1].to(device)
+                target_dist = batch[2].to(device)
+                logits = model(input_ids,
+                               pred_mode="classification",
+                               token_type_ids=None,
+                               attention_mask=input_mask)
+                logits = logits[:, 0, :]
+                preds = nn.LogSoftmax(dim=-1)(logits)
+                loss = self.st_loss(preds.view(-1, self.num_class),
+                                    target_dist.view(-1, self.num_class)) / self.accum_steps
+                total_train_loss += loss.item()
+                loss.backward()
+                if (j + 1) % self.accum_steps == 0:
+                    # Clip the norm of the gradients to 1.0.
+                    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+                    scheduler.step()
+                    model.zero_grad()
+            if self.with_test_label:
+                acc = self.inference(model, test_dataset_loader, return_type="acc")
+                # gather_acc = [torch.ones_like(acc) for _ in range(self.world_size)]
+                # dist.all_gather(gather_acc, acc)
+                # acc = torch.tensor(gather_acc).mean().item()
+            avg_train_loss = torch.tensor([total_train_loss / len(wrap_train_dataset_loader) * self.accum_steps]).to(
+                device)
+            # gather_list = [torch.ones_like(avg_train_loss) for _ in range(self.world_size)]
+            # dist.all_gather(gather_list, avg_train_loss)
+            # avg_train_loss = torch.tensor(gather_list)
+
+            LOGS.log.debug(f"lr: {optimizer.param_groups[0]['lr']:.4g}")
+            LOGS.log.debug(f"Average training loss: {avg_train_loss.item()}")
+            if self.with_test_label:
+                LOGS.log.debug(f"Test acc: {acc}")
+        except RuntimeError as err:
+            self.cuda_mem_error(err, "train")
+
+    def write_results(self, loader_name="final_model.pt", out_file="out.txt"):
+        loader_file = os.path.join(self.model_dir, loader_name)
+        assert os.path.exists(loader_file)
+        LOGS.log.debug(f"\nLoading final model from {loader_file}")
+        self.model.load_state_dict(torch.load(loader_file))
+        # self.model.to(0)
+        test_set = TensorDataset(self.test_data["input_ids"], self.test_data["attention_masks"])
+        test_dataset_loader = DataLoader(test_set, sampler=SequentialSampler(test_set), batch_size=self.eval_batch_size)
+        pred_labels = self.inference(self.model, test_dataset_loader, return_type="pred")
+        out_file = os.path.join(self.dataset_dir, out_file)
+        LOGS.log.debug(f"Writing prediction results to {out_file}")
+        f_out = open(out_file, 'w')
+        for label in pred_labels:
+            f_out.write(str(label.item()) + '\n')
+
 
 
 
@@ -458,7 +623,7 @@ class LOTClassTrainer(object):
                 #     if i in res["category_doc_num"]:
                 #         category_doc_num[i] += res["category_doc_num"][i]
                 if i in gather_res["category_doc_num"]:
-                    category_doc_num[i] += "category_doc_num"[i]
+                    category_doc_num[i] += gather_res["category_doc_num"][i]
             LOGS.log.debug(
                 f"Number of documents with category indicative terms found for each category is: {category_doc_num}")
             self.mcp_data = {"input_ids": all_input_ids, "attention_masks": all_input_mask, "labels": all_mask_label}
@@ -517,101 +682,19 @@ class LOTClassTrainer(object):
             #       LOGS.log.debug(f"Average training loss: {avg_train_loss.mean().item()}")#求loss的平均值，单卡不用求均值
                 LOGS.log.debug(f"Average training loss: {avg_train_loss.item()}")
             # #if rank == 0:
-            loader_file = os.path.join(self.dataset_dir, loader_name)
-            torch.save(self.model.module.state_dict(), loader_file)
+            loader_file = os.path.join(self.model_dir, loader_name)
+            torch.save(self.model.state_dict(), loader_file)
         except RuntimeError as err:
             self.cuda_mem_error(err, "train")
 
     # masked category prediction
     def mcp(self, top_pred_num=50, match_threshold=20, epochs=5, loader_name="mcp_model.pt"):
-        loader_file = os.path.join(self.dataset_dir, loader_name) #os.path.join拼接路径
+        loader_file = os.path.join(self.model_dir, loader_name) #os.path.join拼接路径
         if os.path.exists(loader_file): #os.path.exists檢查指定的路徑是否存在
             LOGS.log.debug(f"\nLoading model trained via masked category prediction from {loader_file}") #log.debug程序调试bug
         else:
             self.prepare_mcp(top_pred_num, match_threshold)
             LOGS.log.debug(f"\nTraining model via masked category prediction.")
-            self.mcp_dist()
+            self.mcp_dist(epochs, loader_name)
             #mp.spawn(self.mcp_dist, nprocs=self.world_size, args=(epochs, loader_name))
         self.model.load_state_dict(torch.load(loader_file))
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-"""------------------------------------------------------------------------------------------------"""
