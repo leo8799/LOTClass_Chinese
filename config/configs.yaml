@@ -14,18 +14,18 @@ data:
   LABEL_NAME_FILE: 'label_names.txt'
   TRAIN_CORPUS: 'train_content.txt'
   TEST_CORPUS: 'test_content.txt'
-  TRAIN_LABEL: ''
-  TEST_LABEL: ''
+#  TRAIN_LABEL: ''
+#  TEST_LABEL: ''
   out_file: 'out.txt'
   final_model: 'final_model.pt'
   bad_case_data: 'bad_case.csv'
 
 train_args:
   pretrained_weights_path: "junnyu/wobert_chinese_plus_base"
-  MAX_LEN: 50
-  TRAIN_BATCH: 32
-  ACCUM_STEP: 8
-  EVAL_BATCH: 128
+  MAX_LEN: 512
+  TRAIN_BATCH: 16
+  ACCUM_STEP: 16
+  EVAL_BATCH: 32
   category_vocab_size: 200
   top_pred_num: 60
   # 设备
@@ -33,8 +33,8 @@ train_args:
   CUDA_VISIBLE_DEVICES: '0,1,2,3'
   # GPU数量
   GPUS: 1
-  MCP_EPOCH: 20
-  SELF_TRAIN_EPOCH: 5
+  MCP_EPOCH: 50
+  SELF_TRAIN_EPOCH: 100
 #  dist_port: 18989
   update_interval: 50
   match_threshold: 3
