@@ -14,8 +14,8 @@ data:
   LABEL_NAME_FILE: 'label_names.txt'
   TRAIN_CORPUS: 'train_content.txt'
   TEST_CORPUS: 'test_content.txt'
-#  TRAIN_LABEL:
-#  TEST_LABEL:
+  TRAIN_LABEL: ''
+  TEST_LABEL: ''
   out_file: 'out.txt'
   final_model: 'final_model.pt'
   bad_case_data: 'bad_case.csv'

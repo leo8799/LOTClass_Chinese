@@ -6,13 +6,12 @@ import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import TensorDataset, DataLoader, SequentialSampler
-from transformers import BertTokenizer, AdamW, get_linear_schedule_with_warmup
 
 from src.model import LOTClassModel
 from config.configs_interface import Configs
 from src.logers import LOGS
 
-from transformers import BertTokenizer, AdamW, get_linear_schedule_with_warmup
+from transformers import AdamW, get_linear_schedule_with_warmup
 from tqdm import tqdm
 from collections import defaultdict
 from joblib import Parallel, delayed
@@ -179,13 +178,13 @@ class LOTClassTrainer(object):
          {inputs_ids: ... , token_type_ids: ... , attention_mask: ...}, ...]
         """
         encoded_dict = self.tokenizer.batch_encode_plus(docs,
-                                                       add_special_tokens=True,  # 是否添加特别Token:[CLS],[SEP]
-                                                       max_length=self.max_len,
-                                                       padding='max_length',
-                                                       pad_to_max_length=True,
-                                                       return_attention_mask=True,
-                                                       truncation=True,  # 是否截断太长的句子
-                                                       return_tensors='pt')
+                                                        add_special_tokens=True,  # 是否添加特别Token:[CLS],[SEP]
+                                                        max_length=self.max_len,
+                                                        padding='max_length',
+                                                        pad_to_max_length=True,
+                                                        return_attention_mask=True,
+                                                        truncation=True,  # 是否截断太长的句子
+                                                        return_tensors='pt')
         input_ids = encoded_dict['input_ids']
         attention_masks = encoded_dict['attention_mask']
         return input_ids, attention_masks
@@ -307,7 +306,7 @@ class LOTClassTrainer(object):
         # 根据category_vocab_size过滤频率过少的token
         for i, cat_dict in self.category_words_freq.items():
             sorted_dict = {k: v for k, v in
-                            sorted(cat_dict.items(), key=lambda item: item[1], reverse=True)[:category_vocab_size]}
+                           sorted(cat_dict.items(), key=lambda item: item[1], reverse=True)[:category_vocab_size]}
             sorted_dicts[i] = sorted_dict
             for word_id in sorted_dict:
                 all_words[word_id].append(i)  # 构造all_words字典，k：token在vocab的id, v：class
@@ -532,10 +531,6 @@ class LOTClassTrainer(object):
         f_out = open(out_file, 'w')
         for label in pred_labels:
             f_out.write(str(label.item()) + '\n')
-
-
-
-
 
     def prepare_mcp_dist(self, top_pred_num=50, match_threshold=20, loader_name="mcp_train.pt"):
         # 调用self.set_up_dist方法设置分布式训练的模型，并将模型设为评估模式
