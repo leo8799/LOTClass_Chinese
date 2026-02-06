@@ -28,7 +28,7 @@ Python 3.6 or above is strongly recommended; using older python versions might l
 
 The meanings of the command line arguments will be displayed upon typing
 ```
-python src/train.py -h
+python test.py -h
 ```
 The following arguments directly affect the performance of the model and need to be set carefully:
 
