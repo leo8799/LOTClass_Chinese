@@ -1,9 +1,9 @@
 # LOTClass_Chinese
 Single_GPU_Chinese_LOTClass
 
-The source code are based on [**Text Classification Using Label Names Only: A Language Model Self-Training Approach**](https://arxiv.org/abs/2010.07245), published in EMNLP 2020.
+The source code is based on [**Text Classification Using Label Names Only: A Language Model Self-Training Approach**](https://arxiv.org/abs/2010.07245), published in EMNLP 2020.
 
-Based on this paper, We integrate Wobert（a Chinese word token BERT model）to apply this model on Chinese text classification task.
+Based on this approach, We integrate Wobert（a Chinese word token BERT model）to apply this model on Chinese text classification task.
 
 ## Requirements
 
